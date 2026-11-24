@@ -4,9 +4,6 @@ use crate::devices::prelude::*;
 use bitfields::{bitfield, bitflag};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use relativity::Instant;
 
 use crate::gui::AudioCallback;
 
@@ -15,6 +12,9 @@ const SAMPLE_RATE: u32 = 44_100;
 
 /// Most audio buffered for the host, in slots (0.25 s)
 const HOST_BUFFER_SLOTS: usize = SAMPLE_RATE as usize / 4;
+
+/// Emulator steps per slot shifted out: the PP5020's 80 MHz over 44.1 kHz.
+const STEPS_PER_SLOT: u32 = 80_000_000 / SAMPLE_RATE;
 
 #[bitflag(u8)]
 #[derive(Debug, PartialEq)]
@@ -192,6 +192,7 @@ struct FifoScr {
 #[derive(Debug)]
 pub struct I2SCon {
     drq: drq::Sender,
+    irq: irq::Sender,
 
     control: Control,
     timing: Timing,
@@ -199,21 +200,22 @@ pub struct I2SCon {
 
     output_fifo: VecDeque<u32>,
 
-    /// Last drain to host_buffer
-    last_drain: Instant,
+    /// Steps since the last slot was shifted out
+    steps: u32,
     host_buffer: Arc<Mutex<VecDeque<u32>>>,
 }
 
 impl I2SCon {
-    pub fn new(drq: drq::Sender) -> I2SCon {
+    pub fn new(drq: drq::Sender, irq: irq::Sender) -> I2SCon {
         let mut i2s = I2SCon {
             drq,
+            irq,
 
             control: Control::new(),
             timing: Timing::new(),
             fifo_scr: FifoScr::new(),
             output_fifo: VecDeque::with_capacity(OUTPUT_FIFO_SLOTS),
-            last_drain: Instant::now(),
+            steps: 0,
             host_buffer: Default::default(),
         };
         // the output FIFO starts empty
@@ -226,31 +228,18 @@ impl I2SCon {
             return;
         }
 
-        // Compute how much frame should be read from self.output_fifo to keep
-        // a steady 44.1kHz output rate
-        let now = Instant::now();
-        let due_frames = (now.duration_since(self.last_drain).as_nanos() * SAMPLE_RATE as u128
-            / 1_000_000_000) as usize;
-        if due_frames == 0 {
+        // Shift out a slot every STEPS_PER_SLOT steps: the emulated CPU's
+        // time, not the host's, so the firmware has as long per sample as
+        // on a real iPod however fast the host runs.
+        self.steps += 1;
+        if self.steps < STEPS_PER_SLOT {
             return;
         }
-
-        if due_frames > self.output_fifo.len() {
-            // Underrun (or first slots after idling): restart the clock from now
-            self.last_drain = now;
-        } else {
-            self.last_drain +=
-                Duration::from_nanos((due_frames as u64 * 1_000_000_000) / SAMPLE_RATE as u64);
-        }
-
-        // Move self.output_fifo frames into host_buffer
-        let n = due_frames.min(self.output_fifo.len());
+        self.steps = 0;
+        let slot = self.output_fifo.pop_front().unwrap();
         let mut host_buffer = self.host_buffer.lock().unwrap();
-        for slot in self.output_fifo.drain(..n) {
-            // Drop slots when the host doesn't keep up
-            if host_buffer.len() < HOST_BUFFER_SLOTS {
-                host_buffer.push_back(slot);
-            }
+        if host_buffer.len() < HOST_BUFFER_SLOTS {
+            host_buffer.push_back(slot);
         }
         drop(host_buffer);
 
@@ -272,7 +261,8 @@ impl I2SCon {
         })
     }
 
-    fn update_drq(&mut self) {
+    /// Whether the output FIFO has room for the attention level's slots.
+    fn attention(&self) -> bool {
         // For the audio output path, the attention level is the amount
         // of minimal free slots we want to use to trigger DMA.
         // Goal here is to AVOID STARVING.
@@ -283,8 +273,19 @@ impl I2SCon {
             3 => 12,
             _ => panic!("Unexpected attention level"),
         };
-        let attention = OUTPUT_FIFO_SLOTS - self.output_fifo.len() >= attention_level;
+        OUTPUT_FIFO_SLOTS - self.output_fifo.len() >= attention_level
+    }
+
+    /// Requests DMA, and interrupts when they're enabled (as Apple's
+    /// firmware does), while the output FIFO has room.
+    fn update_drq(&mut self) {
+        let attention = self.attention();
         self.drq.set(attention);
+        if attention && self.control.qe_fifo1() {
+            self.irq.assert()
+        } else {
+            self.irq.clear()
+        }
     }
 }
 
@@ -311,9 +312,18 @@ impl Device for I2SCon {
 impl Memory for I2SCon {
     fn r32(&mut self, offset: u32) -> MemResult<u32> {
         match offset {
-            0x00 => Err(StubRead(Error, self.control.into_bits())),
+            0x00 => Ok(self.control.into_bits()),
+            0x04 => {
+                let mut status = Status::new();
+                status.set_qs_fifo1(self.attention());
+                Ok(status.into_bits())
+            }
             0x08 => Err(StubRead(Error, self.timing.into_bits())),
-            0x0c => Err(StubRead(Error, self.fifo_scr.into_bits())),
+            // with the free slots in the output FIFO (bits 16..22)
+            0x0c => {
+                let free = (OUTPUT_FIFO_SLOTS - self.output_fifo.len()) as u32;
+                Ok((self.fifo_scr.into_bits() & !(0x3f << 16)) | (free << 16))
+            }
             0x40 => Err(InvalidAccess),
             0x80 => Err(Unimplemented),
             _ => Err(Unexpected),
@@ -326,8 +336,8 @@ impl Memory for I2SCon {
                 self.control.write_bits(val);
                 if self.control.reset() {
                     self.output_fifo.clear();
-                    self.update_drq();
                 }
+                self.update_drq();
 
                 Ok(())
             }
