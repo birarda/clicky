@@ -68,6 +68,12 @@ pub(super) fn run_hle_bootloader(
     const SYSINFO_PTR: u32 = 0x4001_7f1c;
     const SYSINFO_LOC: u32 = 0x4000_ff18;
     ipod.devices.w32(SYSINFO_PTR, SYSINFO_LOC).unwrap(); // pointer to sysinfo
+    // The bootloader also marks the pointer as valid with "IsyS" just before
+    // it. Firmware 3.1.1 checks for it, and without it takes the board to be
+    // another iPod's, and restarts.
+    ipod.devices
+        .w32(SYSINFO_PTR - 4, u32::from_le_bytes(*b"IsyS"))
+        .unwrap();
     ipod.devices.soc.fastram.bulk_write(
         SYSINFO_LOC - 0x4000_0000,
         // FIXME?: this will break on big-endian systems
