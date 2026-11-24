@@ -63,6 +63,7 @@ impl Pp502x {
         let (gpio1_irq_tx, gpio1_irq_rx) = irq::new(irq_pending.clone(), "GPIO1");
         let (gpio2_irq_tx, gpio2_irq_rx) = irq::new(irq_pending.clone(), "GPIO2");
         let (i2c_irq_tx, i2c_irq_rx) = irq::new(irq_pending.clone(), "I2C");
+        let (i2s_irq_tx, i2s_irq_rx) = irq::new(irq_pending.clone(), "I2S");
         let (apb_dma_irq_tx, apb_dma_irq_rx) = irq::new(irq_pending.clone(), "APB-DMA");
         let (mbx_cpu_irq_tx, mbx_cpu_irq_rx) = irq::new(irq_pending.clone(), "Mailbox (CPU)");
         let (mbx_cop_irq_tx, mbx_cop_irq_rx) = irq::new(irq_pending.clone(), "Mailbox (COP)");
@@ -84,7 +85,7 @@ impl Pp502x {
             .register(0, timer1_irq_rx)
             .register(1, timer2_irq_rx)
             .register_core_specific(4, mbx_cpu_irq_rx, mbx_cop_irq_rx)
-            // .register(10, i2s_irq_rx)
+            .register(10, i2s_irq_rx)
             // .register(20, usb_irq_rx)
             .register(23, ide_irq_rx)
             // .register(25, firewire_irq_rx)
@@ -128,7 +129,7 @@ impl Pp502x {
             eidecon: EIDECon::new(ide_irq_tx, ide_dmarq_tx, ide_dmarq_rx),
             memcon: MemCon::new(),
             cachecon: CacheCon::new(),
-            i2s: I2SCon::new(i2s_output_drq_tx),
+            i2s: I2SCon::new(i2s_output_drq_tx, i2s_irq_tx),
             mailbox: Mailbox::new(mbx_cpu_irq_tx, mbx_cop_irq_tx),
             ahb_dma,
             apb_dma,
